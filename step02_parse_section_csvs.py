@@ -2,6 +2,8 @@ import glob
 import os.path
 import pickle
 import sys
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -24,61 +26,133 @@ def parse_6_digit_code(hs_code_str):
     return code1, code_2, code_3
 
 
+@dataclass
+class Row:
+    hs_code: Optional[str]
+    suffix: Optional[str]
+    description: Optional[str]
+
+    def __post_init__(self):
+        if self.hs_code is np.nan or (type(self.hs_code) is str and self.hs_code.strip() == ''):
+            self.hs_code = None
+        else:
+            self.hs_code = self.hs_code.strip()
+
+        if self.suffix is np.nan or (type(self.suffix) is str and self.suffix.strip() == ''):
+            self.suffix = None
+        else:
+            self.suffix = self.suffix.strip()
+
+        if self.description is np.nan or \
+                (type(self.description) is str and self.description.strip() == ''):
+            self.description = None
+        else:
+            self.description = self.description.strip()
+
+    @property
+    def is_section(self):
+        return self.hs_code is not None and len(self.hs_code) == 5 and self.suffix is None
+
+    @property
+    def is_sub_section(self):
+        return self.hs_code is not None and len(self.hs_code) == 7 and self.suffix is None
+
+    @property
+    def is_item(self):
+        return self.suffix is not None and self.description is not None
+
+    @property
+    def is_caption(self):
+        return self.hs_code is None and self.suffix is None and self.description is not None
+
+    @property
+    def parsed_code(self):
+        parts = self.hs_code.split('.')
+
+        assert len(parts) == 2
+
+        if self.is_section:
+            assert all(len(part) == 2 for part in parts)
+            return tuple(parts)
+        elif self.is_sub_section or self.is_item:
+            assert len(parts[0]) == 4 and len(parts[1]) == 2
+            return tuple([parts[0][:2], parts[0][2:], parts[1]])
+
+        raise RuntimeError('Unexpected value')
+
+
 def parse_csv_path(csv_path):
     df = pd.read_csv(csv_path, dtype=str, index_col=0)
 
-    df['is_section'] = ~df['hs_code'].isna() & df['suffix'].isna()
-    df['is_subsection_caption'] = df['hs_code'].isna() & df['suffix'].isna()
-    df['is_suffix'] = ~df['suffix'].isna()
+    sections = []
 
-    df['hs_code'] = df['hs_code'].ffill()
+    curr_section = None
+    for idx, row_ in df.iterrows():
+        row = Row(**row_.to_dict())
 
-    df['hs_code'] = df['hs_code'].apply(lambda x: x.strip() if type(x) == str else x)
-    df['hs_code'] = df['hs_code'].apply(lambda x: x if x else np.nan)
-    df = df[~df['hs_code'].isna() | ~df['suffix'].isna()]
+        if row.is_section or not curr_section:
+            if row.is_item:
+                prev_row = Row(**df.loc[idx - 1].to_dict())
+                if prev_row.is_caption:
+                    section = MainSection(row.parsed_code[:2], prev_row.description)
+                else:
+                    section = MainSection(row.parsed_code[:2], row.description)
+                curr_section = section
+                sections.append(section)
+                sub_section = SubSection(row.parsed_code, row.description)
+                section.sub_sections.append(sub_section)
+                item = Item(sub_section.code, row.suffix, row.description)
+                sub_section.items.append(item)
+                continue
 
-    df['is_main_section'] = df['is_section'] & df['hs_code'].apply(lambda x: '.' in x and x.index('.') == 2)
+            if row.is_sub_section:
+                prev_row = Row(**df.loc[idx - 1].to_dict())
+                if prev_row.is_caption:
+                    section = MainSection(row.parsed_code[:2], prev_row.description)
+                else:
+                    section = MainSection(row.parsed_code[:2], row.description)
+                curr_section = section
+                sections.append(section)
+                sub_section = SubSection(row.parsed_code, row.description)
+                section.sub_sections.append(sub_section)
+                continue
 
-    main_sections = []
-    df_main = df[df['is_main_section'] == True]
-    for _, row in df_main.iterrows():
-        hs_code = row['hs_code']
-        assert len(hs_code) == 5
-        code = tuple(hs_code.split('.'))
-        main_sections.append(MainSection(code, row['description']))
+            if not row.is_section:
+                # initial file rows only
+                continue
 
-    sub_sections = []
-    df_sub = df[df['is_section'] & ~df['is_main_section']]
-    for _, row in df_sub.iterrows():
-        code = parse_6_digit_code(row['hs_code'])
-        sub_sections.append(SubSection(code, row['description']))
+            if not row.description:
+                curr_section = None
+                continue
 
-    items = []
-    df_item = df[df['is_suffix']]
-    for _, row in df_item.iterrows():
-        code = parse_6_digit_code(row['hs_code'])
-        items.append(Item(code, row['suffix'], row['description']))
+            curr_section = MainSection(row.parsed_code, row.description)
+            sections.append(curr_section)
+            continue
 
-    main_section_map = dict((x.code, x) for x in main_sections)
-    sub_section_map = dict((x.code, x) for x in sub_sections)
+        if row.is_sub_section:
+            sub_section = SubSection(row.parsed_code, row.description)
+            curr_section.sub_sections.append(sub_section)
+            continue
 
-    for item in items:
-        sub_section = sub_section_map.get(item.code)
+        if row.is_item:
+            if not curr_section.sub_sections:
+                prev_row = Row(**df.loc[idx - 1].to_dict())
+                if prev_row.is_caption:
+                    sub_section = SubSection(row.parsed_code, prev_row.description)
+                else:
+                    sub_section = SubSection(row.parsed_code, row.description)
+                curr_section.sub_sections.append(sub_section)
 
-        if not sub_section:
-            sub_section = SubSection(item.code, item.description)
-            sub_sections.append(sub_section)
-            sub_section_map[item.code] = sub_section
+            sub_section = curr_section.sub_sections[-1]
+            item = Item(sub_section.code, row.suffix, row.description)
+            sub_section.items.append(item)
+            continue
 
-        sub_section.items.append(item)
+        if row.is_caption:
+            # TODO: handle these
+            continue
 
-    for sub_section in sub_sections:
-        main_section = main_section_map[sub_section.code[:2]]
-        main_section.sub_sections.append(sub_section)
-
-    # TODO: make sense of captions and fill them as categories or something similar
-
-    return main_sections
+    return sections
 
 
 def main():
